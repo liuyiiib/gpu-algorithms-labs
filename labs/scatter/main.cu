@@ -2,6 +2,13 @@
 
 __global__ void s2g_gpu_scatter_kernel(uint32_t *in, uint32_t *out, int len) {
   //@@ INSERT KERNEL CODE HERE
+  int tId = threadIdx.x + blockDim.x * blockIdx.x;
+  if (tId < len * len) {
+    int inIdx = tId % len;
+    int outIdx = tId / len;
+    uint32_t intermediate = outInvariant(in[inIdx]);
+    atomicAdd(&(out[outIdx]), outDependent(intermediate, inIdx, outIdx));  // atomic !
+  }
 }
 
 static void s2g_cpu_scatter(uint32_t *in, uint32_t *out, int len) {
@@ -16,6 +23,9 @@ static void s2g_cpu_scatter(uint32_t *in, uint32_t *out, int len) {
 
 static void s2g_gpu_scatter(uint32_t *in, uint32_t *out, int len) {
   //@@ INSERT CODE HERE
+  int total = len * len;
+  s2g_gpu_scatter_kernel<<<(total - 1) / 256 + 1, 256>>>(in, out, len);
+  cudaDeviceSynchronize();
 }
 
 static int eval(int inputLength) {

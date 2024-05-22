@@ -2,6 +2,15 @@
 
 __global__ void s2g_gpu_gather_kernel(uint32_t *in, uint32_t *out, int len) {
   //@@ INSERT KERNEL CODE HERE
+  int tId = blockDim.x * blockIdx.x + threadIdx.x;
+  if (tId < len) {
+    int out_reg = 0;
+    for (int inIdx = 0; inIdx < len; ++ inIdx) {
+      int intermediate = outInvariant(in[inIdx]);
+      out_reg += outDependent(intermediate, inIdx, tId);
+    }
+    out[tId] += out_reg;
+  }
 }
 
 
@@ -19,6 +28,9 @@ static void s2g_cpu_gather(uint32_t *in, uint32_t *out, int len) {
 
 static void s2g_gpu_gather(uint32_t *in, uint32_t *out, int len) {
   //@@ INSERT CODE HERE
+  int total_len = len * len;
+  s2g_gpu_gather_kernel<<<total_len / 512 + 1, 512>>>(in, out, len);
+  cudaDeviceSynchronize();
 }
 
 

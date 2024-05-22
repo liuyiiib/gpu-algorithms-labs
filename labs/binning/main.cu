@@ -1,6 +1,5 @@
 #include "helper.hpp"
 
-
 /******************************************************************************
  GPU main computation kernels
 *******************************************************************************/
@@ -48,12 +47,34 @@
 __global__ void gpu_normal_kernel(float *in_val, float *in_pos, float *out,
                                   int grid_size, int num_in) {
   //@@ INSERT CODE HERE
+  int tId = blockIdx.x * blockDim.x + threadIdx.x;
+  float res = 0;
+  if (tId < grid_size) {
+    for (int inIdx = 0; inIdx < num_in; ++inIdx) {
+      float in_val2 = in_val[inIdx] * in_val[inIdx];
+      float dist = in_pos[inIdx] - (float)tId;
+      res += in_val2 / (dist * dist);
+    }
+    out[tId] = res;
+  }
 }
 
 __global__ void gpu_cutoff_kernel(float *in_val, float *in_pos, float *out,
                                   int grid_size, int num_in,
                                   float cutoff2) {
   //@@ INSERT CODE HERE
+  int tId = blockIdx.x * blockDim.x + threadIdx.x;
+  float res = 0;
+  if (tId < grid_size) {
+    for (int inIdx = 0; inIdx < num_in; ++inIdx) {
+      float dist = (in_pos[inIdx] - (float)tId) * (in_pos[inIdx] - (float)tId);
+      if (dist < cutoff2) {
+        float in_val2 = in_val[inIdx] * in_val[inIdx];
+        res += in_val2 / dist;
+      }
+    }
+    out[tId] = res;
+  }
 }
 
 __global__ void gpu_cutoff_binned_kernel(int *bin_ptrs,
@@ -61,7 +82,24 @@ __global__ void gpu_cutoff_binned_kernel(int *bin_ptrs,
                                          float *in_pos_sorted, float *out,
                                          int grid_size, float cutoff2) {
   //@@ INSERT CODE HERE
-
+  int tId = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tId < grid_size) {
+    float upper_bound = (float)tId + sqrt(cutoff2);
+    float lower_bound = (float)tId - sqrt(cutoff2);
+    int upper = min(int(upper_bound / grid_size * NUM_BINS), NUM_BINS - 1);
+    int lower = max(int(lower_bound / grid_size * NUM_BINS), 0);
+    float res = 0;
+    int start = bin_ptrs[lower];
+    int end = bin_ptrs[upper + 1];
+    for (int j = start; j < end; ++ j) {
+      float dist = (in_pos_sorted[j] - (float)tId) * (in_pos_sorted[j] - (float)tId);
+      if (dist < cutoff2) {
+        float in_val2 = in_val_sorted[j] * in_val_sorted[j];
+        res += in_val2 / dist;
+      }
+    }
+    out[tId] = res;
+  }
 }
 
 /******************************************************************************
@@ -159,12 +197,76 @@ void gpu_cutoff_binned(int *bin_ptrs, float *in_val_sorted,
 
 __global__ void histogram(float *in_pos, int *bin_counts, int num_in,
                           int grid_size) {
+  __shared__ float share_bin_counts[NUM_BINS];
 
+  const int tx = threadIdx.x;
+  const int bs = blockDim.x;
+  const int idx = tx + blockIdx.x * bs;
+
+  // Is it faster? 
+  // Use shared memory reduce conflicts, but the global memory access per block
+  // increases from 512 to 1024. We also have to add two sycthreads().
+  // For some test cases, num_in / grid_size = 40, which is a large number,
+  // conflict accesses will be frequent. It might be a good idea to use shared memory
+  // But for some small num_in / grid_size, it is definitely not worth it.
+  
+  // Initialize local hist
+  share_bin_counts[tx] = 0;
+  share_bin_counts[tx + bs] = 0;
+  __syncthreads();
+
+  if (idx < num_in){
+    const int binIdx = (int) ((in_pos[idx] / grid_size) * NUM_BINS);
+    atomicAdd(&(share_bin_counts[binIdx]), 1);
+  }
+  __syncthreads();
+
+
+  atomicAdd(&(bin_counts[tx]), share_bin_counts[tx]);
+  atomicAdd(&(bin_counts[tx + bs]), share_bin_counts[tx + bs]);
   //@@ INSERT CODE HERE
 }
 
 __global__ void scan(int *bin_counts, int *bin_ptrs) {
 
+   #define BLOCK_SIZE 512
+  __shared__ float array[2 * BLOCK_SIZE];
+  int tx = threadIdx.x;
+  array[tx] = bin_counts[tx];
+  array[tx + BLOCK_SIZE] = bin_counts[tx + BLOCK_SIZE];
+  
+  // Reduction phase
+  int stride = 1;
+  while(stride < 2 * BLOCK_SIZE)
+  {
+    __syncthreads();
+    int index = (tx + 1) * stride * 2 - 1;
+    if(index < 2 * BLOCK_SIZE)
+      array[index] += array[index - stride];
+    stride *= 2;
+  }
+  
+  // Post scan phase
+  stride = BLOCK_SIZE / 2;
+  while(stride > 0)
+  {
+    __syncthreads();
+    int index = (tx + 1) * 2 * stride - 1;
+    if(index + stride < 2 * BLOCK_SIZE)
+      array[index + stride] += array[index];
+    stride /= 2;
+  }
+  
+  __syncthreads();
+  // Directly write output
+  bin_ptrs[tx + 1] = array[tx];
+  bin_ptrs[tx + BLOCK_SIZE + 1] = array[tx + BLOCK_SIZE];
+  // Since the number of bins is 1024, which just fits into one block
+  // No need for futher prefixFixup
+  if(tx == 0)
+    bin_ptrs[0] = 0;
+  #undef BLOCK_SIZE
+    
   //@@ INSERT CODE HERE
 }
 
@@ -173,6 +275,14 @@ __global__ void sort(float *in_val, float *in_pos, float *in_val_sorted,
                      int *bin_counts, int *bin_ptrs) {
 
   //@@ INSERT CODE HERE
+  int tId = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tId < num_in) {
+    const int binIdx = (int)((in_pos[tId] / grid_size) * NUM_BINS);
+    const int count = atomicAdd(&(bin_counts[binIdx]), -1);
+    const int newIdx = bin_ptrs[binIdx + 1] - count;
+    in_pos_sorted[newIdx] = in_pos[tId];
+    in_val_sorted[newIdx] = in_val[tId];
+  }
 }
 
 /******************************************************************************
@@ -217,7 +327,7 @@ static void gpu_preprocess(float *in_val, float *in_pos,
   const int numThreadsPerBlock = 512;
 
   // Histogram the input positions
-  histogram<<<30, numThreadsPerBlock>>>(in_pos, bin_counts, num_in,
+  histogram<<<(num_in - 1) / numThreadsPerBlock + 1, numThreadsPerBlock>>>(in_pos, bin_counts, num_in,
                                         grid_size);
 
   // Scan the histogram to get the bin pointers
